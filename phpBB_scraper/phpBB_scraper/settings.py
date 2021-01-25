@@ -34,6 +34,10 @@ DOWNLOAD_DELAY = 3.0
 # Disable cookies (enabled by default)
 COOKIES_ENABLED = True
 
+FEED_EXPORTERS = {
+    'xlsx': 'scrapy_xlsx.XlsxItemExporter',
+}
+
 # Disable Telnet Console (enabled by default)
 #TELNETCONSOLE_ENABLED = False
 

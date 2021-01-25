@@ -1,44 +1,44 @@
 # -*- coding: utf-8 -*-
 import re
+import urllib.parse
 import scrapy
 from bs4 import BeautifulSoup
 from scrapy.http import Request
 
-# TODO: Please provide values for the following variables
-# Domains only, no urls
-ALLOWED_DOMAINS = ['']
-# Starting urls
-START_URLS = ['']
-# Is login required? True or False.
-FORM_LOGIN = False
-# Login username
-USERNAME = ''
-# Login password
-PASSWORD = ''
-# Login url
-LOGIN_URL = ''
+#THREADS = {'f=5&t=70'}
 
+#FORUMS = {'f=3', 'f=5'}
 
 class PhpbbSpider(scrapy.Spider):
     
     name = 'phpBB'
-    allowed_domains = ALLOWED_DOMAINS
-    start_urls = START_URLS
-    form_login = FORM_LOGIN
-    if form_login is True:
-        username = USERNAME
-        password = PASSWORD
-        login_url = LOGIN_URL
-        start_urls.insert(0, login_url)
-
     username_xpath = '//p[contains(@class, "author")]//a[contains(@class, "username")]//text()'
-    post_count_xpath = '//dd[@class="profile-posts" or not(@class)]//a/text()'
-    post_time_xpath = '//div[@class="postbody"]//time/@datetime|//div[@class="postbody"]//p[@class="author"]/text()[2]'
     post_text_xpath = '//div[@class="postbody"]//div[@class="content"]'
+
+    def __init__(self, forums=None, threads=None, allowed_domains=None, forum_login=False, 
+        username='', password='', login_url='', start_urls=None, posts_per_page=15, *args, **kwargs):
+        self.forums = forums.split(',') if forums else []
+        self.threads= threads.split(',') if threads else []
+        self.allowed_domains = allowed_domains.split(',') if allowed_domains else ['']
+        self.forum_login = forum_login
+        self.posts_per_page = posts_per_page
+        self.start_urls = []
+        if self.forum_login:
+            self.username = username
+            self.password = password
+            self.login_url = login_url
+            self.start_urls.append(login_url)
+        if start_urls:
+            self.start_urls+= start_urls.split(',')
+        else:
+            self.start_urls.append('')
+
+        super(PhpbbSpider, self).__init__(*args, **kwargs)
+
 
     def parse(self, response):
         # LOGIN TO PHPBB BOARD AND CALL AFTER_LOGIN
-        if self.form_login:
+        if self.forum_login:
             formxpath = '//*[contains(@action, "login")]'
             formdata = {'username': self.username, 'password': self.password}
             form_request = scrapy.FormRequest.from_response(
@@ -53,7 +53,8 @@ class PhpbbSpider(scrapy.Spider):
             # REQUEST SUB-FORUM TITLE LINKS
             links = response.xpath('//a[@class="forumtitle"]/@href').extract()
             for link in links:
-                yield scrapy.Request(response.urljoin(link), callback=self.parse_topics)
+                if link.split('?')[1] in self.forums or not self.forums:
+                    yield scrapy.Request(response.urljoin(link), callback=self.parse_topics)
 
     def after_login(self, response):
         # CHECK LOGIN SUCCESS BEFORE MAKING REQUESTS
@@ -64,18 +65,25 @@ class PhpbbSpider(scrapy.Spider):
             # REQUEST SUB-FORUM TITLE LINKS
             links = response.xpath('//a[@class="forumtitle"]/@href').extract()
             for link in links:
-                yield scrapy.Request(response.urljoin(link), callback=self.parse_topics)
+                if link.split('?')[1] in self.forums or not self.forums:
+                    yield scrapy.Request(response.urljoin(link), callback=self.parse_topics)
 
     def parse_topics(self, response):
         # REQUEST TOPIC TITLE LINKS
         links = response.xpath('//a[@class="topictitle"]/@href').extract()
         for link in links:
-            yield scrapy.Request(response.urljoin(link), callback=self.parse_posts)
+            if link.split('?')[1] in self.threads or not self.threads:
+                yield scrapy.Request(response.urljoin(link), callback=self.parse_posts)
         
         # IF NEXT PAGE EXISTS, FOLLOW
         next_link = response.xpath('//li[@class="next"]//a[@rel="next"]/@href').extract_first()
         if next_link:
             yield scrapy.Request(response.urljoin(next_link), callback=self.parse_topics)   
+
+        subforums = response.xpath('//a[@class="forumtitle"]/@href').extract()
+        for subforum in subforums:
+            if subforum.split('?')[1] in self.forums or not self.forums:
+                yield scrapy.Request(response.urljoin(subforum), callback=self.parse_topics)
     
     def clean_quote(self, string):
         # CLEAN HTML TAGS FROM POST TEXT, MARK QUOTES
@@ -99,18 +107,27 @@ class PhpbbSpider(scrapy.Spider):
         usernames = response.xpath(self.username_xpath).extract()
         n = len(usernames)
         if n > 0:
-            post_counts = response.xpath(self.post_count_xpath).extract() or (n * [''])
-            post_times = response.xpath(self.post_time_xpath).extract() or (n * [''])
             post_texts = response.xpath(self.post_text_xpath).extract() or (n * [''])
             post_quotes = [self.clean_quote(s) for s in post_texts]
             post_texts = [self.clean_text(s) for s in post_texts]
 
             # YIELD POST DATA
             for i in range(n):
-                yield {'Username': str(usernames[i]).strip(), 'PostCount': str(post_counts[i]).strip(),
-                       'PostTime': str(post_times[i]).strip(), 'PostText': post_texts[i], 'QuoteText': post_quotes[i]}
+                yield {'Username': str(usernames[i]).strip(), 'Post': post_texts[i], 
+                'Quote': post_quotes[i]}
 
-        # CLICK THROUGH NEXT PAGE
-        next_link = response.xpath('//li[@class="next"]//a[@rel="next"]/@href').extract_first()
-        if next_link:
-            yield scrapy.Request(response.urljoin(next_link), callback=self.parse_posts)
+        # This gets you the url but without the forum (not sure why that's not included)
+        my_page = urllib.parse.urlparse(response.xpath('//link[@rel="canonical"]/@href').extract_first())
+        # But this gets the forum in any case
+        forum = urllib.parse.urlparse(response.xpath('//a[@class="left-box arrow-left"]/@href').extract_first()).query
+        query = my_page.query.split('&')
+        
+        # these should be all the links to other pages of the thread
+        page_links = response.xpath('//a[@class="button"]//@href').extract()
+        if 'start' in query[-1]:
+            my_page_start = int(query[-1].split('=')[1])
+            prospective_req = f'.{my_page.path}?{forum}&{query[0]}&start={my_page_start + self.posts_per_page}'
+        else:
+            prospective_req = f'.{my_page.path}?{forum}&{query[0]}&start={self.posts_per_page}'
+        if prospective_req in page_links:
+            yield scrapy.Request(response.urljoin(prospective_req), callback=self.parse_posts)
